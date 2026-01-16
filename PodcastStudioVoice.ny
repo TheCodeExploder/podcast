@@ -5,7 +5,7 @@ $preview linear
 $name (_ "Podcast Studio Voice")
 $action (_ "Polishing voice...")
 $author "Codex"
-$release 0.2.0
+$release 0.3.0
 $copyright (_ "GNU General Public License v2.0 or later")
 
 ;; Podcast Studio Voice - an easy-mode voice polish chain for spoken word.
@@ -21,38 +21,50 @@ $copyright (_ "GNU General Public License v2.0 or later")
 (setf LOWCUT 80)
 (setf WARMTH -2)
 (setf PRESENCE 3)
+(setf AIR 2)
+
+(setf BREATH-THRESHOLD -38)
+(setf BREATH-REDUCTION -6)
+(setf BREATH-ATTACK 5)
+(setf BREATH-HOLD 30)
+(setf BREATH-DECAY 120)
+
 (setf DEESS 2)
 (setf DEESS-FREQ 6500)
+
+(setf HF-LIMITER -8)
 (setf LIMITER -1)
 (setf OUTPUT 0)
 
-;; ---- Noise gate (adapted from Audacity noisegate.ny) ----
-(setf SILENCE-FLAG (if (> GATE-REDUCTION -96) 0 1))
-(setf GATE-FREQ 0.0)
-(setf FLOOR (db-to-linear GATE-REDUCTION))
-(setf THRESHOLD (db-to-linear GATE-THRESHOLD))
-(setf ATTACK (/ GATE-ATTACK 1000.0))
-(setf LOOKAHEAD ATTACK)
-(setf DECAY (/ GATE-DECAY 1000.0))
-(setf HOLD (/ GATE-HOLD 1000.0))
+;; ---- Gate helpers (adapted from Audacity noisegate.ny) ----
+(defun gate-env (follow threshold-db reduction-db attack-ms hold-ms decay-ms)
+  (let* ((silence-flag (if (> reduction-db -96) 0 1))
+         (floor (db-to-linear reduction-db))
+         (threshold (db-to-linear threshold-db))
+         (attack (/ attack-ms 1000.0))
+         (lookahead attack)
+         (decay (/ decay-ms 1000.0))
+         (hold (/ hold-ms 1000.0))
+         (gate-env (gate follow lookahead attack decay floor threshold))
+         (gate-env (clip gate-env 1.0)))
+    (diff gate-env (* silence-flag floor))))
 
-(defun noisegate (sig follow)
-  (let ((gain (/ (- 1 (* SILENCE-FLAG FLOOR))))
-        (env (get-env follow)))
+(defun noisegate-with-params (sig follow threshold-db reduction-db attack-ms hold-ms decay-ms)
+  (let* ((silence-flag (if (> reduction-db -96) 0 1))
+         (floor (db-to-linear reduction-db))
+         (env (gate-env follow threshold-db reduction-db attack-ms hold-ms decay-ms))
+         (gain (/ (- 1 (* silence-flag floor)))))
     (mult sig gain env)))
 
-(defun get-env (follow)
-  (let* ((gate-env (gate follow LOOKAHEAD ATTACK DECAY FLOOR THRESHOLD))
-         (gate-env (clip gate-env 1.0)))
-    (diff gate-env (* SILENCE-FLAG FLOOR))))
-
-(defun peak-follower (sig)
-  (setf sig (multichan-expand #'snd-abs sig))
-  (when (arrayp sig)
-    (setf sig (s-max (aref sig 0) (aref sig 1))))
-  (if (> HOLD 0)
-      (multichan-expand #'snd-oneshot sig THRESHOLD HOLD)
-      sig))
+(defun peak-follower-with (sig threshold-db hold-ms)
+  (let* ((threshold (db-to-linear threshold-db))
+         (hold (/ hold-ms 1000.0)))
+    (setf sig (multichan-expand #'snd-abs sig))
+    (when (arrayp sig)
+      (setf sig (s-max (aref sig 0) (aref sig 1))))
+    (if (> hold 0)
+        (multichan-expand #'snd-oneshot sig threshold hold)
+        sig)))
 
 ;; ---- Limiter (adapted from Audacity legacy-limiter.ny) ----
 (setf LIMITER-HOLD 10.0)
@@ -93,12 +105,29 @@ $copyright (_ "GNU General Public License v2.0 or later")
     (when (>= DEESS-FREQ nyq)
       (throw 'err (_ "Error: De-ess frequency is too high for this track sample rate.")))))
 
+(defun tame-breaths-and-clicks (sig)
+  ;; Split band: tame high-frequency breaths/clicks, keep body intact.
+  (let* ((split 3000.0)
+         (low (lowpass2 sig split))
+         (high (highpass2 sig split))
+         (follow (peak-follower-with high BREATH-THRESHOLD BREATH-HOLD))
+         (high (noisegate-with-params high follow
+                                      BREATH-THRESHOLD BREATH-REDUCTION
+                                      BREATH-ATTACK BREATH-HOLD BREATH-DECAY))
+         (high (hardlimit high (db-to-linear HF-LIMITER))))
+    (sum low high)))
+
 (defun process-chain (sig)
   (validate)
-  (let* ((sig (noisegate sig (peak-follower sig)))
+  (let* ((follow (peak-follower-with sig GATE-THRESHOLD GATE-HOLD))
+         (sig (noisegate-with-params sig follow
+                                     GATE-THRESHOLD GATE-REDUCTION
+                                     GATE-ATTACK GATE-HOLD GATE-DECAY))
          (sig (highpass2 sig LOWCUT))
+         (sig (tame-breaths-and-clicks sig))
          (sig (if (/= WARMTH 0) (eq-lowshelf sig 160 WARMTH) sig))
          (sig (if (/= PRESENCE 0) (eq-highshelf sig 3500 PRESENCE) sig))
+         (sig (if (/= AIR 0) (eq-highshelf sig 8000 AIR) sig))
          (sig (if (> DEESS 0) (deess sig DEESS DEESS-FREQ) sig))
          (sig (hardlimit sig (db-to-linear LIMITER)))
          (sig (if (/= OUTPUT 0) (mult (db-to-linear OUTPUT) sig) sig)))
